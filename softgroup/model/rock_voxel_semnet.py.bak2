@@ -1,0 +1,212 @@
+import functools
+from collections import OrderedDict
+
+import numpy as np
+import spconv.pytorch as spconv
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ..ops import voxelization
+from ..util import cuda_cast
+from .blocks import MLP, ResidualBlock, UBlock
+
+
+class RockVoxelSemNet(nn.Module):
+    """
+    自定义岩体结构面语义网络（体素化版本）
+    目标：
+    1) 只做 semantic segmentation
+    2) 复用你现有 SoftGroup 的数据流（voxel_coords / p2v_map / v2p_map / coords_float / feats）
+    3) 后续可直接接 HDBSCAN / region growing / plane fitting
+    """
+
+    def __init__(self,
+                 in_channels=6,            # 这里对应 feat 维度，例如 rgb+normal=6
+                 channels=32,              # backbone 基础宽度
+                 num_blocks=7,
+                 semantic_only=True,       # 保持兼容现有配置
+                 semantic_classes=3,
+                 instance_classes=0,       # 兼容字段，不使用
+                 semantic_weight=None,
+                 sem2ins_classes=None,     # 兼容字段，不使用
+                 ignore_label=-100,
+                 with_coords=True,         # True 时会额外拼接 xyz
+                 grouping_cfg=None,        # 兼容字段，不使用
+                 instance_voxel_cfg=None,  # 兼容字段，不使用
+                 train_cfg=None,           # 兼容字段，不使用
+                 test_cfg=None,
+                 fixed_modules=None,
+                 **kwargs):
+        super().__init__()
+
+        if sem2ins_classes is None:
+            sem2ins_classes = []
+        if fixed_modules is None:
+            fixed_modules = []
+
+        self.in_channels = in_channels
+        self.channels = channels
+        self.num_blocks = num_blocks
+        self.semantic_only = semantic_only
+        self.semantic_classes = semantic_classes
+        self.instance_classes = instance_classes
+        self.ignore_label = ignore_label
+        self.with_coords = with_coords
+        self.grouping_cfg = grouping_cfg
+        self.instance_voxel_cfg = instance_voxel_cfg
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+        self.fixed_modules = fixed_modules
+        self.sem2ins_classes = sem2ins_classes
+
+        if semantic_weight is not None:
+            weight = torch.tensor(semantic_weight, dtype=torch.float32)
+            self.register_buffer('semantic_weight', weight)
+        else:
+            self.semantic_weight = None
+
+        block = ResidualBlock
+        norm_fn = functools.partial(nn.BatchNorm1d, eps=1e-4, momentum=0.1)
+
+        # 真正进入 sparse conv 的输入维度
+        input_c = in_channels + (3 if with_coords else 0)
+
+        # backbone
+        self.input_conv = spconv.SparseSequential(
+            spconv.SubMConv3d(
+                input_c, channels, kernel_size=3, padding=1, bias=False, indice_key='subm1'
+            )
+        )
+        block_channels = [channels * (i + 1) for i in range(num_blocks)]
+        self.unet = UBlock(block_channels, norm_fn, 2, block, indice_key_id=1)
+        self.output_layer = spconv.SparseSequential(norm_fn(channels), nn.ReLU())
+
+        # semantic head
+        self.semantic_linear = MLP(channels, semantic_classes, norm_fn=norm_fn, num_layers=2)
+
+        self.init_weights()
+
+        for mod_name in fixed_modules:
+            mod = getattr(self, mod_name)
+            for p in mod.parameters():
+                p.requires_grad = False
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, MLP):
+                m.init_weights()
+
+    def train(self, mode=True):
+        super().train(mode)
+        for mod_name in self.fixed_modules:
+            mod = getattr(self, mod_name)
+            for m in mod.modules():
+                if isinstance(m, nn.BatchNorm1d):
+                    m.eval()
+
+    def _forward_backbone(self, voxel_coords, p2v_map, v2p_map, coords_float, feats, spatial_shape, batch_size):
+        if self.with_coords:
+            feats = torch.cat((feats, coords_float), dim=1)
+
+        voxel_feats = voxelization(feats, p2v_map)
+        x = spconv.SparseConvTensor(
+            voxel_feats,
+            voxel_coords.int(),
+            spatial_shape,
+            batch_size
+        )
+
+        x = self.input_conv(x)
+        x = self.unet(x)
+        x = self.output_layer(x)
+
+        point_feats = x.features[v2p_map.long()]
+        semantic_scores = self.semantic_linear(point_feats)
+        return semantic_scores, point_feats
+
+    @cuda_cast
+    def forward_train(self,
+                      batch_idxs,
+                      voxel_coords,
+                      p2v_map,
+                      v2p_map,
+                      coords_float,
+                      feats,
+                      semantic_labels,
+                      spatial_shape,
+                      batch_size,
+                      **kwargs):
+        semantic_scores, _ = self._forward_backbone(
+            voxel_coords, p2v_map, v2p_map, coords_float, feats, spatial_shape, batch_size
+        )
+
+        loss_sem = F.cross_entropy(
+            semantic_scores,
+            semantic_labels.long(),
+            weight=self.semantic_weight,
+            ignore_index=self.ignore_label
+        )
+
+        with torch.no_grad():
+            preds = semantic_scores.max(1)[1]
+            valid = semantic_labels != self.ignore_label
+            if valid.any():
+                acc = (preds[valid] == semantic_labels[valid]).float().mean()
+            else:
+                acc = semantic_scores.new_tensor(0.0)
+
+        log_vars = OrderedDict(
+            loss=loss_sem.detach(),
+            semantic_loss=loss_sem.detach(),
+            semantic_acc=acc.detach()
+        )
+        return loss_sem, log_vars
+
+    @cuda_cast
+    def forward_test(self,
+                     batch_idxs,
+                     voxel_coords,
+                     p2v_map,
+                     v2p_map,
+                     coords_float,
+                     feats,
+                     semantic_labels=None,
+                     spatial_shape=None,
+                     batch_size=1,
+                     scan_ids=None,
+                     **kwargs):
+        semantic_scores, _ = self._forward_backbone(
+            voxel_coords, p2v_map, v2p_map, coords_float, feats, spatial_shape, batch_size
+        )
+
+        semantic_preds = semantic_scores.max(1)[1]
+
+        if isinstance(scan_ids, (list, tuple)) and len(scan_ids) > 0:
+            scan_id = scan_ids[0]
+        else:
+            scan_id = scan_ids
+
+        n = semantic_preds.shape[0]
+        zeros = np.zeros((n, 3), dtype=np.float32)
+
+        result = dict(
+            scan_id=scan_id,
+            semantic_preds=semantic_preds.cpu().numpy(),
+            semantic_scores=semantic_scores.detach().cpu().numpy(),
+            offset_preds=zeros,  # 为兼容现有评估接口保留
+            offset_labels=zeros
+        )
+
+        if semantic_labels is not None:
+            result['semantic_labels'] = semantic_labels.cpu().numpy()
+
+        return result
+
+    def forward(self, batch, return_loss=False):
+        if return_loss:
+            return self.forward_train(**batch)
+        return self.forward_test(**batch)

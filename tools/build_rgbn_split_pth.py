@@ -1,0 +1,189 @@
+# -*- coding: utf-8 -*-
+import os
+import math
+import torch
+import numpy as np
+from scipy.spatial import cKDTree
+
+def torch_load_compat(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+
+INPUT_FILES = {
+    "train": "/home/chj/SoftGroup/dataset/rockjoint_split/train/wysbp_train.pth",
+    "val":   "/home/chj/SoftGroup/dataset/rockjoint_split/val/wysbp_val.pth",
+    "test_a": "/home/chj/SoftGroup/dataset/rockjoint_split/test/wysbp_test_a.pth",
+    "test_b": "/home/chj/SoftGroup/dataset/rockjoint_split/test/wysbp_test_b.pth",
+}
+
+OUTPUT_FILES = {
+    "train": "/home/chj/SoftGroup/dataset/rockjoint_split_rgbn/train/wysbp_train.pth",
+    "val":   "/home/chj/SoftGroup/dataset/rockjoint_split_rgbn/val/wysbp_val.pth",
+    "test_a": "/home/chj/SoftGroup/dataset/rockjoint_split_rgbn/test/wysbp_test_a.pth",
+    "test_b": "/home/chj/SoftGroup/dataset/rockjoint_split_rgbn/test/wysbp_test_b.pth",
+}
+
+K_NEIGHBORS = 24
+CHUNK_SIZE = 20000
+EPS = 1e-12
+
+
+def ensure_dir(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+
+def to_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    if torch.is_tensor(x):
+        return x.cpu().numpy()
+    return np.asarray(x)
+
+
+def normalize_rgb(rgb: np.ndarray) -> np.ndarray:
+    rgb = rgb.astype(np.float32)
+    maxv = float(np.max(rgb)) if rgb.size > 0 else 0.0
+    if maxv > 1.5:
+        rgb = rgb / 255.0
+    rgb = np.clip(rgb, 0.0, 1.0)
+    return rgb.astype(np.float32)
+
+
+def canonical_orient_normals(normals: np.ndarray) -> np.ndarray:
+    """
+    给法向一个稳定的符号约定，避免同一平面法向前后翻转。
+    规则：
+    1) 优先让 nz >= 0
+    2) 若 nz 约等于 0，则让 ny >= 0
+    3) 若 ny 也约等于 0，则让 nx >= 0
+    """
+    n = normals.copy()
+    flip = n[:, 2] < 0
+    n[flip] *= -1.0
+
+    mask_z0 = np.abs(n[:, 2]) < 1e-8
+    flip_y = mask_z0 & (n[:, 1] < 0)
+    n[flip_y] *= -1.0
+
+    mask_zy0 = mask_z0 & (np.abs(n[:, 1]) < 1e-8)
+    flip_x = mask_zy0 & (n[:, 0] < 0)
+    n[flip_x] *= -1.0
+    return n
+
+
+def estimate_normals_pca(xyz: np.ndarray, k: int = 24, chunk_size: int = 20000) -> np.ndarray:
+    """
+    用局部 PCA 估计每个点法向。
+    xyz: (N, 3)
+    返回 normals: (N, 3)
+    """
+    xyz = xyz.astype(np.float32)
+    n_points = xyz.shape[0]
+    if n_points == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    if n_points < k + 1:
+        out = np.zeros((n_points, 3), dtype=np.float32)
+        out[:, 2] = 1.0
+        return out
+
+    tree = cKDTree(xyz)
+    normals = np.zeros((n_points, 3), dtype=np.float32)
+
+    for start in range(0, n_points, chunk_size):
+        end = min(start + chunk_size, n_points)
+        pts = xyz[start:end]
+
+        dists, idx = tree.query(pts, k=k + 1, workers=-1)
+        nbr = xyz[idx]  # (B, k+1, 3)
+
+        center = np.mean(nbr, axis=1, keepdims=True)
+        diff = nbr - center
+
+        # 协方差矩阵: (B, 3, 3)
+        cov = np.einsum("bni,bnj->bij", diff, diff) / float(k + 1)
+
+        # 最小特征值对应的特征向量 = 法向
+        eigvals, eigvecs = np.linalg.eigh(cov)  # eigvecs: (B, 3, 3)
+        nrm = eigvecs[:, :, 0]  # 最小特征值对应列向量
+
+        nrm = nrm / np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), EPS)
+        normals[start:end] = nrm.astype(np.float32)
+
+        print(f"[normal] {end}/{n_points}")
+
+    normals = canonical_orient_normals(normals)
+    normals = normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), EPS)
+
+    bad = ~np.isfinite(normals).all(axis=1)
+    if np.any(bad):
+        normals[bad] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+
+    return normals.astype(np.float32)
+
+
+def process_one(in_file: str, out_file: str, k: int = 24, chunk_size: int = 20000):
+    print(f"\n[load] {in_file}")
+    data = torch_load_compat(in_file)
+
+    if not isinstance(data, (list, tuple)) or len(data) != 4:
+        raise RuntimeError(f"{in_file} 不是 4 元组 (xyz, feat/rgb, semantic_label, instance_label)")
+
+    xyz, feat_or_rgb, semantic_label, instance_label = data
+
+    xyz = to_numpy(xyz).astype(np.float32)
+    rgb = to_numpy(feat_or_rgb).astype(np.float32)
+    semantic_label = to_numpy(semantic_label).astype(np.int64)
+    instance_label = to_numpy(instance_label).astype(np.int64)
+
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise RuntimeError(f"{in_file} xyz 维度错误: {xyz.shape}")
+    if rgb.ndim != 2 or rgb.shape[0] != xyz.shape[0]:
+        raise RuntimeError(f"{in_file} feat/rgb 维度错误: {rgb.shape}, xyz={xyz.shape}")
+    if semantic_label.shape[0] != xyz.shape[0]:
+        raise RuntimeError(f"{in_file} semantic_label 长度错误")
+    if instance_label.shape[0] != xyz.shape[0]:
+        raise RuntimeError(f"{in_file} instance_label 长度错误")
+
+    if rgb.shape[1] < 3:
+        raise RuntimeError(f"{in_file} 第二个数组至少应有 3 维 RGB，当前是 {rgb.shape[1]}")
+
+    rgb = rgb[:, :3]
+    rgb = normalize_rgb(rgb)
+
+    print("[normal] estimating...")
+    normals = estimate_normals_pca(xyz, k=k, chunk_size=chunk_size)
+
+    feat_rgbn = np.concatenate([rgb, normals], axis=1).astype(np.float32)
+
+    print(f"[save] {out_file}")
+    ensure_dir(out_file)
+    torch.save(
+        (
+            torch.from_numpy(xyz),
+            torch.from_numpy(feat_rgbn),
+            torch.from_numpy(semantic_label),
+            torch.from_numpy(instance_label),
+        ),
+        out_file
+    )
+
+    print(f"[done] xyz={xyz.shape}, feat_rgbn={feat_rgbn.shape}, sem={semantic_label.shape}, ins={instance_label.shape}")
+
+
+def main():
+    for key in ["train", "val", "test_a", "test_b"]:
+        process_one(
+            INPUT_FILES[key],
+            OUTPUT_FILES[key],
+            k=K_NEIGHBORS,
+            chunk_size=CHUNK_SIZE
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+work_dirs/**/*.pth
+!work_dirs/softgroup_rockjoint_j1j5_semantic_only_vox0p022/epoch_56.pth
+
+work_dirs/**/*.log
+work_dirs/**/events.out.tfevents.*
+
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db

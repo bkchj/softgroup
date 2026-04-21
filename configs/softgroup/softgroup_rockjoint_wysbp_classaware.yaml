@@ -1,0 +1,88 @@
+model:
+  channels: 32
+  num_blocks: 7
+  semantic_only: False
+  semantic_classes: 3
+  instance_classes: 3
+  sem2ins_classes: []
+  ignore_label: -100
+  semantic_weight: [3.5, 2.2, 1.0]
+
+  grouping_cfg:
+    use_geo_grouping: False
+    score_thr: 0.08
+    radius: 0.05
+    mean_active: 120
+    class_numpoint_mean: [900, 1600, 5363]
+    npoint_thr: 0.02
+    ignore_classes: []
+
+    # ===== 新增 ↓ =====
+    class_score_thr: [0.04, 0.06, 0.08]
+    class_radius:    [0.035, 0.045, 0.05]
+    class_npoint_thr: [0.010, 0.015, 0.020]
+  instance_voxel_cfg:
+    scale: 80
+    spatial_shape: 24
+
+  train_cfg:
+    max_proposal_num: 400
+    pos_iou_thr: 0.30
+
+  test_cfg:
+    x4_split: False
+    eval_tasks: ['semantic', 'instance']
+    cls_score_thr: 0.0005
+    mask_score_thr: -0.20
+    min_npoint: 30
+
+data:
+  train:
+    type: rockjoint
+    data_root: /home/chj/SoftGroup/dataset/rockjoint_split
+    prefix: train
+    suffix: .pth
+    training: True
+    with_label: True
+    repeat: 10
+    x4_split: False
+    voxel_cfg:
+      scale: 50
+      spatial_shape: [128, 640]
+      max_npoint: 400000
+      min_npoint: 30
+
+  test:
+    type: rockjoint
+    data_root: /home/chj/SoftGroup/dataset/rockjoint_split
+    prefix: val
+    suffix: .pth
+    training: False
+    with_label: True
+    repeat: 1
+    x4_split: False
+    voxel_cfg:
+      scale: 50
+      spatial_shape: [128, 640]
+      max_npoint: 400000
+      min_npoint: 30
+
+dataloader:
+  train:
+    batch_size: 1
+    num_workers: 4
+  test:
+    batch_size: 1
+    num_workers: 2
+
+optimizer:
+  type: AdamW
+  lr: 0.00005
+  weight_decay: 0.0001
+
+fp16: False
+epochs: 40
+step_epoch: 20
+save_freq: 4
+pretrain: '/home/chj/SoftGroup/work_dirs/softgroup_rockjoint_wysbp_augv2_pos025/epoch_28.pth'
+work_dir: ./work_dirs/softgroup_rockjoint_wysbp_classaware

@@ -1,0 +1,86 @@
+model:
+  channels: 32
+  num_blocks: 7
+  semantic_only: True
+  semantic_classes: 5
+  instance_classes: 5
+  sem2ins_classes: []
+  ignore_label: -100
+  semantic_weight: [0.30, 0.80, 2.50, 1.20, 1.60]
+
+  grouping_cfg:
+    use_geo_grouping: False
+    score_thr: 0.08
+    radius: 0.05
+    mean_active: 120
+    class_numpoint_mean: [900, 1600, 3000, 3000, 3000]
+    npoint_thr: 0.02
+    ignore_classes: []
+
+  instance_voxel_cfg:
+    scale: 80
+    spatial_shape: 24
+
+  train_cfg:
+    max_proposal_num: 400
+    pos_iou_thr: 0.30
+    offset_loss_weight: 0.0
+    embedding_loss_weight: 0.0
+
+  test_cfg:
+    x4_split: False
+    eval_tasks: ['semantic']
+    cls_score_thr: 0.0005
+    mask_score_thr: -0.20
+    min_npoint: 30
+
+data:
+  train:
+    type: rockjoint
+    data_root: /home/chj/SoftGroup/dataset/rockjoint_split_j1j5_xyzonly_v2
+    prefix: train
+    suffix: .pth
+    training: True
+    with_label: True
+    repeat: 10
+    x4_split: False
+    voxel_cfg:
+      scale: 40
+      spatial_shape: [128, 640]
+      max_npoint: 400000
+      min_npoint: 30
+
+  test:
+    type: rockjoint
+    data_root: /home/chj/SoftGroup/dataset/rockjoint_split_j1j5_xyzonly_v2
+    prefix: test_a
+    suffix: .pth
+    training: False
+    with_label: True
+    repeat: 1
+    x4_split: False
+    voxel_cfg:
+      scale: 40
+      spatial_shape: [128, 640]
+      max_npoint: 400000
+      min_npoint: 30
+
+dataloader:
+  train:
+    batch_size: 1
+    num_workers: 4
+  test:
+    batch_size: 1
+    num_workers: 2
+
+optimizer:
+  type: AdamW
+  lr: 0.0001
+  weight_decay: 0.0001
+
+fp16: False
+epochs: 64
+step_epoch: 32
+save_freq: 8
+pretrain: ''
+work_dir: ./work_dirs/softgroup_rockjoint_j1j5_semantic_only_vox0p025

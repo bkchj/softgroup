@@ -1,0 +1,178 @@
+import os.path as osp
+from glob import glob
+
+import numpy as np
+import torch
+
+from .custom import CustomDataset
+
+
+def torch_load_compat(filename):
+    """
+    兼容 PyTorch 2.6+:
+    torch.load 默认 weights_only=True，会导致普通数据 .pth 读取失败。
+    """
+    try:
+        return torch.load(filename, map_location='cpu', weights_only=False)
+    except TypeError:
+        return torch.load(filename, map_location='cpu')
+
+
+class RockJointDataset(CustomDataset):
+
+    CLASSES = ('J1', 'J2', 'J3')
+
+    def __init__(self, x4_split=False, **kwargs):
+        super().__init__(**kwargs)
+        self.x4_split = x4_split
+
+    def get_filenames(self):
+        if isinstance(self.prefix, str):
+            self.prefix = [self.prefix]
+        filenames_all = []
+        for p in self.prefix:
+            filenames = glob(osp.join(self.data_root, p, '*' + self.suffix))
+            assert len(filenames) > 0, f'Empty split folder: {osp.join(self.data_root, p)}'
+            filenames_all.extend(filenames)
+        filenames_all = sorted(filenames_all * self.repeat)
+        return filenames_all
+
+    def load(self, filename):
+        """
+        你的 .pth 结构是:
+        (xyz, rgb, semantic_label, instance_label)
+        """
+        xyz, rgb, semantic_label, instance_label = torch_load_compat(filename)
+
+        xyz = np.asarray(xyz, dtype=np.float32)
+        rgb = np.asarray(rgb, dtype=np.float32)
+        semantic_label = np.asarray(semantic_label, dtype=np.int64)
+        instance_label = np.asarray(instance_label, dtype=np.int64)
+
+        # 保险检查
+        assert xyz.ndim == 2 and xyz.shape[1] == 3, f'xyz shape error: {xyz.shape}'
+        assert rgb.ndim == 2 and rgb.shape[1] == 3, f'rgb shape error: {rgb.shape}'
+        assert len(xyz) == len(rgb) == len(semantic_label) == len(instance_label), \
+            'xyz/rgb/semantic_label/instance_label length mismatch'
+
+        # 如果后续有无效标签，可在这里统一改成 -100
+        semantic_label = semantic_label.astype(np.int64, copy=False)
+        instance_label = instance_label.astype(np.int64, copy=False)
+
+        # 训练时可选 1/4 采样
+        if self.training and self.x4_split:
+            N = xyz.shape[0]
+            inds = np.random.choice(N, int(N * 0.25), replace=False)
+            xyz = xyz[inds]
+            rgb = rgb[inds]
+            semantic_label = semantic_label[inds]
+            instance_label = self.getCroppedInstLabel(instance_label, inds)
+
+        return xyz, rgb, semantic_label, instance_label
+
+    def crop(self, xyz, step=64):
+        return super().crop(xyz, step=step)
+
+    def transform_train(self, xyz, rgb, semantic_label, instance_label, aug_prob=1.0):
+        # 对 J1/J2/J3 这类按方向定义的结构面组，
+        # 关闭会破坏方向语义的增强：rot / flip / elastic
+        xyz_middle = xyz.copy()
+        xyz = xyz_middle * self.voxel_cfg.scale
+        xyz = xyz - xyz.min(0)
+
+        max_tries = 10
+        success = False
+        valid_idxs = None
+        xyz_offset = None
+
+        for _ in range(max_tries):
+            xyz_offset_try, valid_idxs_try = self.crop(xyz)
+            if valid_idxs_try.sum() >= self.voxel_cfg.min_npoint:
+                xyz_offset = xyz_offset_try
+                valid_idxs = valid_idxs_try
+                success = True
+                break
+
+        if not success:
+            print('[WARN] crop failed, fallback to full sample', flush=True)
+            xyz_offset = xyz.copy()
+            valid_idxs = np.ones(xyz.shape[0], dtype=bool)
+
+        xyz = xyz_offset[valid_idxs]
+        xyz_middle = xyz_middle[valid_idxs]
+        rgb = rgb[valid_idxs]
+        semantic_label = semantic_label[valid_idxs]
+        instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
+
+        if xyz.shape[0] > self.voxel_cfg.max_npoint:
+            choice = np.random.choice(xyz.shape[0], self.voxel_cfg.max_npoint, replace=False)
+            xyz = xyz[choice]
+            xyz_middle = xyz_middle[choice]
+            rgb = rgb[choice]
+            semantic_label = semantic_label[choice]
+            instance_label = instance_label[choice]
+            instance_label = self.getCroppedInstLabel(
+                instance_label, np.ones(len(instance_label), dtype=bool))
+
+        return xyz, xyz_middle, rgb, semantic_label, instance_label
+
+    def transform_test(self, xyz, rgb, semantic_label, instance_label):
+        # 测试阶段同样不做方向扰动
+        xyz_middle = xyz.copy()
+        xyz = xyz_middle * self.voxel_cfg.scale
+        xyz -= xyz.min(0)
+        valid_idxs = np.ones(xyz.shape[0], dtype=bool)
+        instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
+        return xyz, xyz_middle, rgb, semantic_label, instance_label
+
+    def transform_train(self, xyz, rgb, semantic_label, instance_label, aug_prob=1.0):
+        # 对 J1/J2/J3 这类按方向定义的结构面组，
+        # 关闭会破坏方向语义的增强：rot / flip / elastic
+        xyz_middle = xyz.copy()
+        xyz = xyz_middle * self.voxel_cfg.scale
+        xyz = xyz - xyz.min(0)
+
+        max_tries = 10
+        success = False
+        valid_idxs = None
+        xyz_offset = None
+
+        for _ in range(max_tries):
+            xyz_offset_try, valid_idxs_try = self.crop(xyz)
+            if valid_idxs_try.sum() >= self.voxel_cfg.min_npoint:
+                xyz_offset = xyz_offset_try
+                valid_idxs = valid_idxs_try
+                success = True
+                break
+
+        if not success:
+            print('[WARN] crop failed, fallback to full sample', flush=True)
+            xyz_offset = xyz.copy()
+            valid_idxs = np.ones(xyz.shape[0], dtype=bool)
+
+        xyz = xyz_offset[valid_idxs]
+        xyz_middle = xyz_middle[valid_idxs]
+        rgb = rgb[valid_idxs]
+        semantic_label = semantic_label[valid_idxs]
+        instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
+
+        if xyz.shape[0] > self.voxel_cfg.max_npoint:
+            choice = np.random.choice(xyz.shape[0], self.voxel_cfg.max_npoint, replace=False)
+            xyz = xyz[choice]
+            xyz_middle = xyz_middle[choice]
+            rgb = rgb[choice]
+            semantic_label = semantic_label[choice]
+            instance_label = instance_label[choice]
+            instance_label = self.getCroppedInstLabel(
+                instance_label, np.ones(len(instance_label), dtype=bool))
+
+        return xyz, xyz_middle, rgb, semantic_label, instance_label
+
+    def transform_test(self, xyz, rgb, semantic_label, instance_label):
+        # 测试阶段同样不做方向扰动
+        xyz_middle = xyz.copy()
+        xyz = xyz_middle * self.voxel_cfg.scale
+        xyz -= xyz.min(0)
+        valid_idxs = np.ones(xyz.shape[0], dtype=bool)
+        instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
+        return xyz, xyz_middle, rgb, semantic_label, instance_label
